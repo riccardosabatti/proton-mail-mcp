@@ -1,0 +1,9 @@
+{
+  "email": "you@proton.me",
+  "bridge_password": "the-bridge-specific-password-from-Bridge-settings",
+  "imap_host": "127.0.0.1",
+  "imap_port": 1143,
+  "smtp_host": "127.0.0.1",
+  "smtp_port": 1025,
+  "tls_cert_path": ""
+}
