@@ -71,9 +71,12 @@ def make_ssl_context(cfg):
     return ctx
 
 
+CONNECT_TIMEOUT = 15
+
+
 def imap_connect(cfg):
     ctx = make_ssl_context(cfg)
-    conn = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"])
+    conn = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"], timeout=CONNECT_TIMEOUT)
     conn.starttls(ssl_context=ctx)
     conn.login(cfg["email"], cfg["bridge_password"])
     return conn
@@ -172,6 +175,15 @@ def _uid_search_literal(conn, keyword, value):
     if status != "OK":
         raise RuntimeError(f"IMAP SEARCH {keyword} failed: {data}")
     return {u.decode() for u in data[0].split()}
+
+
+def _addr_list(*values):
+    # email.utils.getaddresses has a real footgun: with >=2 empty strings in
+    # its input list it silently collapses to a single bogus ('', '') result
+    # instead of parsing the non-empty ones (verified: getaddresses(['a@b.com',
+    # '', '']) == [('', '')], dropping 'a@b.com' entirely) — so always filter
+    # blanks out before calling it, never pass optional cc/bcc through as "".
+    return getaddresses([v for v in values if v])
 
 
 def _snippet(body, n=SNIPPET_CHARS):
@@ -476,9 +488,11 @@ def imap_move(cfg, folder, uid, target_folder):
 
 
 def _smtp_deliver(cfg, msg, all_recipients):
+    # Unlike Bridge's IMAP (plaintext + STARTTLS), its SMTP port expects TLS
+    # from the first byte (implicit TLS, like SMTPS) — STARTTLS here just hangs
+    # waiting for a plaintext greeting that never comes, until it times out.
     ctx = make_ssl_context(cfg)
-    with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"]) as server:
-        server.starttls(context=ctx)
+    with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"], context=ctx, timeout=CONNECT_TIMEOUT) as server:
         server.login(cfg["email"], cfg["bridge_password"])
         server.sendmail(cfg["email"], all_recipients, msg.as_string())
 
@@ -492,7 +506,7 @@ def smtp_send(cfg, to, subject, body, cc, bcc):
     msg["To"] = to
     if cc:
         msg["Cc"] = cc
-    all_recipients = [addr for _, addr in getaddresses([to, cc or "", bcc or ""]) if addr]
+    all_recipients = [addr for _, addr in _addr_list(to, cc, bcc) if addr]
     _smtp_deliver(cfg, msg, all_recipients)
     return {"sent_to": all_recipients, "subject": subject}
 
@@ -550,7 +564,7 @@ def imap_reply(cfg, folder, uid, body, reply_all):
         if references:
             msg["References"] = references
 
-        all_recipients = [addr for _, addr in getaddresses([to_header, cc_header]) if addr]
+        all_recipients = [addr for _, addr in _addr_list(to_header, cc_header) if addr]
         _smtp_deliver(cfg, msg, all_recipients)
 
         try:
