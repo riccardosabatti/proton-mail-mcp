@@ -39,6 +39,23 @@ This is designed to run on your own machine and nowhere else — no server, no s
    }
    ```
 
+## Multiple accounts
+
+Proton Mail Bridge supports logging in more than one account at once, each getting its own local IMAP/SMTP port pair (visible in Bridge's account settings). This server takes its config path as an optional first argument (or the `PROTON_MCP_CONFIG` env var) instead of always defaulting to `~/.config/proton-mcp/config.json`, so run one process per account and register each as its own MCP server:
+
+```sh
+# second account
+cp config.example.json ~/.config/proton-mcp/config-work.json
+chmod 600 ~/.config/proton-mcp/config-work.json
+# edit it with the second account's email + its own Bridge password + the IMAP/SMTP ports Bridge assigned it
+
+claude mcp add -s user proton-mail-work -- python3 /path/to/proton-mail-mcp/server.py ~/.config/proton-mcp/config-work.json
+```
+
+Claude Desktop: same idea, add a second `mcpServers` entry with its own name and `"args": ["/path/to/server.py", "/Users/you/.config/proton-mcp/config-work.json"]`.
+
+Each account gets its own config file (so its own file permissions and blast radius) and its own set of tool names (`mcp__proton-mail-work__search_emails` vs. `mcp__proton-mail-personal__search_emails`) — no shared state between them, and no extra "which account" parameter to pass on every call.
+
 ## Tools
 
 | Tool | Read-only | Notes |

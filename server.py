@@ -3,8 +3,17 @@
 
 Talks to Proton Mail Bridge over local IMAP/SMTP. Never leaves this machine:
 no network listener, no shared credential store. Config (incl. the Bridge
-password) lives in ~/.config/proton-mcp/config.json, mode 600, read once at
-startup.
+password) lives in ~/.config/proton-mcp/config.json by default, mode 600,
+read once at startup.
+
+Multiple accounts: Bridge itself supports logging in more than one account,
+each on its own local IMAP/SMTP port pair. Point separate invocations of this
+same script at separate config files (one per account) — pass the path as the
+first CLI arg, or set PROTON_MCP_CONFIG — and register each as its own MCP
+server (e.g. "proton-mail-personal", "proton-mail-work"). Tool names then
+naturally disambiguate accounts (mcp__proton-mail-work__search_emails vs.
+mcp__proton-mail-personal__search_emails) with no extra "account" parameter
+needed on every call.
 """
 import sys
 import os
@@ -19,7 +28,9 @@ from email import message_from_bytes
 from email.mime.text import MIMEText
 from email.utils import formataddr, parseaddr, getaddresses, parsedate_to_datetime
 
-CONFIG_PATH = os.path.expanduser("~/.config/proton-mcp/config.json")
+CONFIG_PATH = os.path.expanduser(
+    sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PROTON_MCP_CONFIG", "~/.config/proton-mcp/config.json")
+)
 SERVER_NAME = "proton-mail-personal"
 SERVER_VERSION = "1.0.0"
 MAX_SEARCH_LIMIT = 100
