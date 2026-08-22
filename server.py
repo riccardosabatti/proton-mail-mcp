@@ -39,6 +39,7 @@ DEFAULT_SEARCH_FOLDER = "All Mail"
 DEFAULT_MAX_BODY_CHARS = 6000
 SNIPPET_CHARS = 200
 HAS_ATTACHMENT_SCAN_CAP = 300
+DEFAULT_DOWNLOADS_DIR = "~/Downloads/proton-mail-mcp"
 
 
 def log(msg):
@@ -423,6 +424,60 @@ def imap_get_email(cfg, folder, uid, max_chars):
             pass
 
 
+def imap_download_attachment(cfg, folder, uid, filename):
+    uid = _validate_uid(uid)
+    conn = imap_connect(cfg)
+    try:
+        status, _ = conn.select(_imap_quote(folder), readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"cannot open folder {folder!r}")
+        status, msg_data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
+        if status != "OK" or not msg_data or msg_data[0] is None:
+            raise RuntimeError(f"message uid {uid} not found in {folder!r}")
+        msg = message_from_bytes(msg_data[0][1])
+
+        match = None
+        for part in msg.walk():
+            if part.get_content_disposition() == "attachment":
+                name = " ".join((part.get_filename() or "").split())
+                if name == filename:
+                    match = part
+                    break
+        if match is None:
+            raise RuntimeError(f"no attachment named {filename!r} on uid {uid} — available: {_attachment_list(msg)}")
+
+        # The filename comes from the email itself (untrusted) — an
+        # attachment could claim a name like "../../.ssh/authorized_keys" to
+        # escape the intended directory. basename() strips any path
+        # components, but a bare "." or ".." has none to strip and would
+        # resolve to the containing directory itself, so reject those too.
+        safe_name = os.path.basename(filename)
+        if not safe_name or safe_name in (".", ".."):
+            safe_name = "attachment"
+        out_dir = os.path.join(
+            os.path.expanduser(cfg.get("downloads_dir") or DEFAULT_DOWNLOADS_DIR),
+            folder.replace("/", "_"),
+            uid,
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, safe_name)
+        payload = match.get_payload(decode=True) or b""
+        with open(out_path, "wb") as f:
+            f.write(payload)
+
+        return {
+            "path": out_path,
+            "filename": safe_name,
+            "size_bytes": len(payload),
+            "content_type": match.get_content_type(),
+        }
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
 def imap_unread_count(cfg, folder):
     conn = imap_connect(cfg)
     try:
@@ -655,6 +710,20 @@ TOOLS = [
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "download_attachment",
+        "description": "Download one email attachment to local disk. Get its exact filename from get_email's `attachments` list first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uid": {"type": "string"},
+                "folder": {"type": "string", "default": "INBOX"},
+                "filename": {"type": "string", "description": "must match a name from get_email's attachments list"},
+            },
+            "required": ["uid", "filename"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
         "name": "send_email",
         "description": "Send an email from the personal Proton account.",
         "inputSchema": {
@@ -759,6 +828,8 @@ def dispatch_tool(cfg, name, args):
         )
     if name == "get_email":
         return imap_get_email(cfg, args.get("folder", "INBOX"), args["uid"], args.get("max_chars"))
+    if name == "download_attachment":
+        return imap_download_attachment(cfg, args.get("folder", "INBOX"), args["uid"], args["filename"])
     if name == "send_email":
         return smtp_send(cfg, args["to"], args["subject"], args["body"], args.get("cc"), args.get("bcc"))
     if name == "get_unread_count":

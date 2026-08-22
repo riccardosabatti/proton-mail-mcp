@@ -63,6 +63,7 @@ Each account gets its own config file (so its own file permissions and blast rad
 | `list_folders` | yes | folders/labels available |
 | `search_emails` | yes | see below |
 | `get_email` | yes | full body by UID, truncated past `max_chars` |
+| `download_attachment` | no | saves to disk under `downloads_dir` (default `~/Downloads/proton-mail-mcp`), one subfolder per folder/UID |
 | `get_unread_count` | yes | |
 | `mark_read` | no | toggles `\Seen`, reversible |
 | `move_email` | no | to an existing folder/label |
@@ -90,6 +91,7 @@ Results are ranked by the message's actual `Date` header, not IMAP UID — Bridg
 
 - `imaplib` encodes normal command arguments as ASCII and raises `UnicodeEncodeError` on anything else — so any user-supplied search text is sent as an IMAP *literal* (`{n}\r\n<utf-8 bytes>`) with `CHARSET UTF-8` declared, which is the only way through `imaplib` to search for non-ASCII text correctly. Each literal-bearing keyword (`FROM`/`TO`/`CC`/`SUBJECT`/`TEXT`) is searched separately and the resulting UID sets are intersected client-side, because `imaplib` only supports one literal per command.
 - Date ranking batches a header-only `UID FETCH` (comma-joined UID set, chunked) across every matched message — cheap since it skips message bodies — rather than fetching one message at a time.
+- `download_attachment`'s filename comes from the email itself, which is untrusted content — a message could name its attachment `../../.ssh/authorized_keys` (or bare `..`) to try to write outside the intended folder. The filename is reduced to its basename and a bare `.`/`..` is rejected outright before it ever reaches a path.
 
 ## License
 
