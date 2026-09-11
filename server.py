@@ -24,6 +24,7 @@ import html
 import imaplib
 import smtplib
 import datetime
+import base64
 from email import message_from_bytes
 from email.mime.text import MIMEText
 from email.utils import formataddr, parseaddr, getaddresses, parsedate_to_datetime
@@ -40,6 +41,7 @@ DEFAULT_MAX_BODY_CHARS = 6000
 SNIPPET_CHARS = 200
 HAS_ATTACHMENT_SCAN_CAP = 300
 DEFAULT_DOWNLOADS_DIR = "~/Downloads/proton-mail-mcp"
+VIEW_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024  # inline preview cap — above this, use download_attachment
 
 
 def log(msg):
@@ -478,6 +480,51 @@ def imap_download_attachment(cfg, folder, uid, filename):
             pass
 
 
+def imap_view_attachment(cfg, folder, uid, filename):
+    # Unlike download_attachment (writes to disk, returns a path), this returns the
+    # raw bytes inline as base64 so an MCP client can render/preview them directly
+    # (e.g. Claude Desktop's inline image/document viewer) — nothing touches disk.
+    uid = _validate_uid(uid)
+    conn = imap_connect(cfg)
+    try:
+        status, _ = conn.select(_imap_quote(folder), readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"cannot open folder {folder!r}")
+        status, msg_data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
+        if status != "OK" or not msg_data or msg_data[0] is None:
+            raise RuntimeError(f"message uid {uid} not found in {folder!r}")
+        msg = message_from_bytes(msg_data[0][1])
+
+        match = None
+        for part in msg.walk():
+            if part.get_content_disposition() == "attachment":
+                name = " ".join((part.get_filename() or "").split())
+                if name == filename:
+                    match = part
+                    break
+        if match is None:
+            raise RuntimeError(f"no attachment named {filename!r} on uid {uid} — available: {_attachment_list(msg)}")
+
+        payload = match.get_payload(decode=True) or b""
+        if len(payload) > VIEW_ATTACHMENT_MAX_BYTES:
+            raise RuntimeError(
+                f"attachment {filename!r} is {len(payload)} bytes, over the "
+                f"{VIEW_ATTACHMENT_MAX_BYTES}-byte inline preview cap — use download_attachment instead"
+            )
+
+        return {
+            "filename": filename,
+            "content_type": match.get_content_type() or "application/octet-stream",
+            "size_bytes": len(payload),
+            "data_b64": base64.b64encode(payload).decode("ascii"),
+        }
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
 def imap_unread_count(cfg, folder):
     conn = imap_connect(cfg)
     try:
@@ -724,6 +771,26 @@ TOOLS = [
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
     {
+        "name": "view_attachment",
+        "description": (
+            "Return an email attachment's raw bytes inline (base64), instead of saving to disk, so the "
+            "client can render/preview it directly — e.g. Claude Desktop showing an image or PDF inline "
+            f"rather than just a file path. Capped at {VIEW_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB; for "
+            "larger files use download_attachment instead. Get the exact filename from get_email's "
+            "`attachments` list first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uid": {"type": "string"},
+                "folder": {"type": "string", "default": "INBOX"},
+                "filename": {"type": "string", "description": "must match a name from get_email's attachments list"},
+            },
+            "required": ["uid", "filename"],
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "send_email",
         "description": "Send an email from the personal Proton account.",
         "inputSchema": {
@@ -806,6 +873,26 @@ TOOLS = [
 ]
 
 
+def view_attachment_content(cfg, folder, uid, filename):
+    att = imap_view_attachment(cfg, folder, uid, filename)
+    label = {"type": "text", "text": f"{att['filename']} ({att['content_type']}, {att['size_bytes']} bytes)"}
+    if att["content_type"].startswith("image/"):
+        body = {"type": "image", "data": att["data_b64"], "mimeType": att["content_type"]}
+    else:
+        # MCP's image content type is image-only; everything else (PDF, Office docs, ...)
+        # goes as an embedded resource blob — whether the client renders a preview for
+        # non-image mimeTypes (vs. just offering a download) is client-dependent.
+        body = {
+            "type": "resource",
+            "resource": {
+                "uri": f"proton-mail://{folder}/{uid}/{filename}",
+                "mimeType": att["content_type"],
+                "blob": att["data_b64"],
+            },
+        }
+    return [label, body]
+
+
 def dispatch_tool(cfg, name, args):
     if name == "list_folders":
         return imap_folder_list(cfg)
@@ -876,12 +963,16 @@ def handle_request(cfg, req):
         name = params.get("name")
         args = params.get("arguments", {}) or {}
         try:
-            result = dispatch_tool(cfg, name, args)
+            if name == "view_attachment":
+                content = view_attachment_content(cfg, args.get("folder", "INBOX"), args["uid"], args["filename"])
+            else:
+                result = dispatch_tool(cfg, name, args)
+                content = [{"type": "text", "text": json.dumps(result, indent=2)}]
             send_message(
                 {
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}], "isError": False},
+                    "result": {"content": content, "isError": False},
                 }
             )
         except Exception as e:
