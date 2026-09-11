@@ -25,6 +25,9 @@ import imaplib
 import smtplib
 import datetime
 import base64
+import subprocess
+import tempfile
+import shutil
 from email import message_from_bytes
 from email.mime.text import MIMEText
 from email.utils import formataddr, parseaddr, getaddresses, parsedate_to_datetime
@@ -42,6 +45,14 @@ SNIPPET_CHARS = 200
 HAS_ATTACHMENT_SCAN_CAP = 300
 DEFAULT_DOWNLOADS_DIR = "~/Downloads/proton-mail-mcp"
 VIEW_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024  # inline preview cap — above this, use download_attachment
+# Claude's image content block only accepts these four; anything else sent as an "image" media_type
+# is rejected by the API schema, and MCP's alternative "resource" content type was verified live to
+# not work either — the claude.ai/Desktop client coerces it into an image block anyway and hits the
+# same media_type rejection instead of falling back gracefully. So a PDF can't be sent as-is; it has
+# to be rasterized to actual PNG pages first (see _render_pdf_to_png_pages) to go through this path.
+ALLOWED_IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+PDF_MAX_PAGES = 5  # cap on how many rendered pages one view_attachment call will return
+PDF_RENDER_DPI = 150  # legible for text-heavy documents (e.g. invoices) without ballooning PNG size
 
 
 def log(msg):
@@ -480,10 +491,11 @@ def imap_download_attachment(cfg, folder, uid, filename):
             pass
 
 
-def imap_view_attachment(cfg, folder, uid, filename):
-    # Unlike download_attachment (writes to disk, returns a path), this returns the
-    # raw bytes inline as base64 so an MCP client can render/preview them directly
-    # (e.g. Claude Desktop's inline image/document viewer) — nothing touches disk.
+def imap_fetch_attachment_bytes(cfg, folder, uid, filename):
+    # Raw fetch only — no size gating, no base64. Callers (view_attachment_content)
+    # decide what cap makes sense for the content_type they got back (a source PDF
+    # gets rasterized before its real output size is known, so gating here would be
+    # gating the wrong number).
     uid = _validate_uid(uid)
     conn = imap_connect(cfg)
     try:
@@ -506,23 +518,44 @@ def imap_view_attachment(cfg, folder, uid, filename):
             raise RuntimeError(f"no attachment named {filename!r} on uid {uid} — available: {_attachment_list(msg)}")
 
         payload = match.get_payload(decode=True) or b""
-        if len(payload) > VIEW_ATTACHMENT_MAX_BYTES:
-            raise RuntimeError(
-                f"attachment {filename!r} is {len(payload)} bytes, over the "
-                f"{VIEW_ATTACHMENT_MAX_BYTES}-byte inline preview cap — use download_attachment instead"
-            )
-
-        return {
-            "filename": filename,
-            "content_type": match.get_content_type() or "application/octet-stream",
-            "size_bytes": len(payload),
-            "data_b64": base64.b64encode(payload).decode("ascii"),
-        }
+        return payload, match.get_content_type() or "application/octet-stream"
     finally:
         try:
             conn.logout()
         except Exception:
             pass
+
+
+def _render_pdf_to_png_pages(payload):
+    # Shells out to poppler's pdftoppm rather than adding a PDF-parsing dependency —
+    # keeps the server stdlib-only on the Python side; poppler is a system package
+    # (`brew install poppler`), not a pip dependency of this project.
+    pdftoppm = shutil.which("pdftoppm")
+    if not pdftoppm:
+        raise RuntimeError(
+            "pdftoppm (poppler) not found on this machine — install it (`brew install poppler`) to "
+            "enable inline PDF preview, or use download_attachment instead"
+        )
+    with tempfile.TemporaryDirectory(prefix="proton-mcp-pdf-") as tmpdir:
+        src_path = os.path.join(tmpdir, "in.pdf")
+        with open(src_path, "wb") as f:
+            f.write(payload)
+        out_prefix = os.path.join(tmpdir, "page")
+        proc = subprocess.run(
+            [pdftoppm, "-png", "-r", str(PDF_RENDER_DPI), "-f", "1", "-l", str(PDF_MAX_PAGES), src_path, out_prefix],
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"pdftoppm failed: {proc.stderr.decode(errors='replace')[:500]}")
+        page_files = sorted(f for f in os.listdir(tmpdir) if f.startswith("page") and f.endswith(".png"))
+        if not page_files:
+            raise RuntimeError("pdftoppm produced no pages — the PDF may be empty, encrypted, or corrupted")
+        pages = []
+        for f in page_files:
+            with open(os.path.join(tmpdir, f), "rb") as fh:
+                pages.append(fh.read())
+        return pages
 
 
 def imap_unread_count(cfg, folder):
@@ -773,11 +806,11 @@ TOOLS = [
     {
         "name": "view_attachment",
         "description": (
-            "Return an email attachment's raw bytes inline (base64), instead of saving to disk, so the "
-            "client can render/preview it directly — e.g. Claude Desktop showing an image or PDF inline "
-            f"rather than just a file path. Capped at {VIEW_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB; for "
-            "larger files use download_attachment instead. Get the exact filename from get_email's "
-            "`attachments` list first."
+            "Show an email attachment inline instead of saving it to disk. Images (jpeg/png/gif/webp) are "
+            f"returned directly; PDFs are rasterized to one PNG per page (up to {PDF_MAX_PAGES} pages, "
+            "requires poppler's pdftoppm on this machine). Other file types aren't supported here — use "
+            f"download_attachment for those, or if the file is over {VIEW_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB. "
+            "Get the exact filename from get_email's `attachments` list first."
         ),
         "inputSchema": {
             "type": "object",
@@ -873,24 +906,45 @@ TOOLS = [
 ]
 
 
+def _image_block(payload, mime_type):
+    return {"type": "image", "data": base64.b64encode(payload).decode("ascii"), "mimeType": mime_type}
+
+
 def view_attachment_content(cfg, folder, uid, filename):
-    att = imap_view_attachment(cfg, folder, uid, filename)
-    label = {"type": "text", "text": f"{att['filename']} ({att['content_type']}, {att['size_bytes']} bytes)"}
-    if att["content_type"].startswith("image/"):
-        body = {"type": "image", "data": att["data_b64"], "mimeType": att["content_type"]}
-    else:
-        # MCP's image content type is image-only; everything else (PDF, Office docs, ...)
-        # goes as an embedded resource blob — whether the client renders a preview for
-        # non-image mimeTypes (vs. just offering a download) is client-dependent.
-        body = {
-            "type": "resource",
-            "resource": {
-                "uri": f"proton-mail://{folder}/{uid}/{filename}",
-                "mimeType": att["content_type"],
-                "blob": att["data_b64"],
-            },
-        }
-    return [label, body]
+    payload, content_type = imap_fetch_attachment_bytes(cfg, folder, uid, filename)
+
+    if content_type in ALLOWED_IMAGE_MEDIA_TYPES:
+        if len(payload) > VIEW_ATTACHMENT_MAX_BYTES:
+            raise RuntimeError(
+                f"attachment {filename!r} is {len(payload)} bytes, over the "
+                f"{VIEW_ATTACHMENT_MAX_BYTES}-byte inline preview cap — use download_attachment instead"
+            )
+        label = {"type": "text", "text": f"{filename} ({content_type}, {len(payload)} bytes)"}
+        return [label, _image_block(payload, content_type)]
+
+    if content_type == "application/pdf":
+        if len(payload) > VIEW_ATTACHMENT_MAX_BYTES:
+            raise RuntimeError(
+                f"{filename!r} is {len(payload)} bytes, over the {VIEW_ATTACHMENT_MAX_BYTES}-byte cap on "
+                f"source PDFs for inline rendering — use download_attachment instead"
+            )
+        pages = _render_pdf_to_png_pages(payload)
+        total = sum(len(p) for p in pages)
+        if total > VIEW_ATTACHMENT_MAX_BYTES:
+            raise RuntimeError(
+                f"{filename!r} rendered to {len(pages)} page(s) totalling {total} bytes, over the "
+                f"{VIEW_ATTACHMENT_MAX_BYTES}-byte inline preview cap — use download_attachment instead"
+            )
+        note = f"{filename} — {len(pages)} page(s) rendered as images"
+        if len(pages) == PDF_MAX_PAGES:
+            note += f" (capped at {PDF_MAX_PAGES}; there may be more — use download_attachment for the full file)"
+        label = {"type": "text", "text": note}
+        return [label] + [_image_block(p, "image/png") for p in pages]
+
+    raise RuntimeError(
+        f"{filename!r} is {content_type!r}, which can't be previewed inline in this client (only images "
+        "and PDF, rendered to images, are supported) — use download_attachment instead"
+    )
 
 
 def dispatch_tool(cfg, name, args):
