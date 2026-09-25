@@ -68,7 +68,8 @@ Each account gets its own config file (so its own file permissions and blast rad
 | `mark_read` | no | toggles `\Seen`, reversible |
 | `move_email` | no | to an existing folder/label |
 | `reply_to_email` | no | threads via In-Reply-To/References, quotes the original |
-| `create_draft` | no | saves without sending |
+| `create_draft` | no | saves without sending, returns the new draft's UID |
+| `delete_draft` | no | Drafts folder only, refuses anything not flagged `\Draft`; moves to Trash (recoverable) instead of expunging, since Bridge turns an expunge from Drafts into a permanent delete |
 | `send_email` | no | |
 
 Every non-read-only tool is annotated as such (`readOnlyHint: false`), so MCP clients will ask for confirmation before running it.

@@ -40,6 +40,8 @@ SERVER_VERSION = "1.0.0"
 MAX_SEARCH_LIMIT = 100
 DEFAULT_SEARCH_LIMIT = 20
 DEFAULT_SEARCH_FOLDER = "All Mail"
+DRAFTS_FOLDER = "Drafts"
+TRASH_FOLDER = "Trash"
 DEFAULT_MAX_BODY_CHARS = 6000
 SNIPPET_CHARS = 200
 HAS_ATTACHMENT_SCAN_CAP = 300
@@ -93,6 +95,12 @@ def imap_connect(cfg):
     conn = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"], timeout=CONNECT_TIMEOUT)
     conn.starttls(ssl_context=ctx)
     conn.login(cfg["email"], cfg["bridge_password"])
+    # imaplib caches CAPABILITY from before login and never refreshes it, but Bridge
+    # only advertises MOVE/UIDPLUS once authenticated (verified) — without this
+    # re-read every `"MOVE" in conn.capabilities` check silently takes the fallback.
+    status, data = conn.capability()
+    if status == "OK" and data and data[-1]:
+        conn.capabilities = tuple(data[-1].decode().upper().split())
     return conn
 
 
@@ -594,6 +602,22 @@ def imap_mark_read(cfg, folder, uid, read):
             pass
 
 
+def _uid_move(conn, uid, target_folder):
+    # Prefer RFC 6851 MOVE (atomic); fall back to COPY+\Deleted+EXPUNGE for
+    # servers that don't advertise it. imaplib.capabilities is always a
+    # tuple of str (see IMAP4._get_capabilities), never bytes.
+    if "MOVE" in conn.capabilities:
+        status, data = conn.uid("MOVE", uid, _imap_quote(target_folder))
+        if status != "OK":
+            raise RuntimeError(f"IMAP MOVE failed: {data}")
+    else:
+        status, data = conn.uid("COPY", uid, _imap_quote(target_folder))
+        if status != "OK":
+            raise RuntimeError(f"IMAP COPY failed: {data}")
+        conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+
+
 def imap_move(cfg, folder, uid, target_folder):
     uid = _validate_uid(uid)
     conn = imap_connect(cfg)
@@ -601,19 +625,7 @@ def imap_move(cfg, folder, uid, target_folder):
         status, _ = conn.select(_imap_quote(folder), readonly=False)
         if status != "OK":
             raise RuntimeError(f"cannot open folder {folder!r}")
-        # Prefer RFC 6851 MOVE (atomic); fall back to COPY+\Deleted+EXPUNGE for
-        # servers that don't advertise it. imaplib.capabilities is always a
-        # tuple of str (see IMAP4._get_capabilities), never bytes.
-        if "MOVE" in conn.capabilities:
-            status, data = conn.uid("MOVE", uid, _imap_quote(target_folder))
-            if status != "OK":
-                raise RuntimeError(f"IMAP MOVE failed: {data}")
-        else:
-            status, data = conn.uid("COPY", uid, _imap_quote(target_folder))
-            if status != "OK":
-                raise RuntimeError(f"IMAP COPY failed: {data}")
-            conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-            conn.expunge()
+        _uid_move(conn, uid, target_folder)
         return {"uid": uid, "from": folder, "to": target_folder}
     finally:
         try:
@@ -726,8 +738,51 @@ def imap_create_draft(cfg, to, subject, body, cc):
         msg["Cc"] = cc
     conn = imap_connect(cfg)
     try:
-        conn.append(_imap_quote("Drafts"), "(\\Draft)", None, msg.as_string().encode("utf-8"))
-        return {"folder": "Drafts", "to": to, "subject": subject}
+        status, data = conn.append(_imap_quote(DRAFTS_FOLDER), "(\\Draft)", None, msg.as_string().encode("utf-8"))
+        if status != "OK":
+            raise RuntimeError(f"IMAP APPEND failed: {data}")
+        result = {"folder": DRAFTS_FOLDER, "to": to, "subject": subject}
+        # UIDPLUS (RFC 4315) reports the new message's UID as `[APPENDUID <validity> <uid>]` —
+        # hand it back so the caller can delete_draft it without a search round trip.
+        m = re.search(rb"APPENDUID \d+ (\d+)", data[0] or b"") if data else None
+        if m:
+            result["uid"] = m.group(1).decode()
+        return result
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def imap_delete_draft(cfg, uid):
+    # Scoped to Drafts on purpose: no folder argument, so this can never be pointed
+    # at real mail. It moves to Trash rather than expunging, because Bridge turns an
+    # EXPUNGE out of Drafts into a permanent server-side delete (proton-bridge
+    # imapservice/connector.go, RemoveMessagesFromMailbox) — Trash keeps it
+    # recoverable, same as "delete" on a draft in the Proton web app.
+    uid = _validate_uid(uid)
+    conn = imap_connect(cfg)
+    try:
+        status, _ = conn.select(_imap_quote(DRAFTS_FOLDER), readonly=False)
+        if status != "OK":
+            raise RuntimeError(f"cannot open folder {DRAFTS_FOLDER!r}")
+        status, data = conn.uid("FETCH", uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (TO SUBJECT DATE)])")
+        if status != "OK" or not data or not isinstance(data[0], tuple):
+            raise RuntimeError(f"no draft with uid {uid} in {DRAFTS_FOLDER!r} (find it via search_emails with folder='Drafts')")
+        # FLAGS can come before or after the header literal depending on the server.
+        meta = b" ".join([data[0][0]] + [x for x in data[1:] if isinstance(x, bytes)]).decode(errors="replace")
+        if "\\Draft" not in meta:
+            raise RuntimeError(f"uid {uid} in {DRAFTS_FOLDER!r} is not flagged \\Draft — refusing to delete it")
+        hdr = message_from_bytes(data[0][1])
+        _uid_move(conn, uid, TRASH_FOLDER)
+        return {
+            "uid": uid,
+            "to": _decode_header_value(hdr.get("To")),
+            "subject": _decode_header_value(hdr.get("Subject")),
+            "date": hdr.get("Date", ""),
+            "moved_to": TRASH_FOLDER,
+        }
     finally:
         try:
             conn.logout()
@@ -890,7 +945,7 @@ TOOLS = [
     },
     {
         "name": "create_draft",
-        "description": "Save an email as a draft in the Drafts folder without sending it.",
+        "description": "Save an email as a draft in the Drafts folder without sending it. Returns the new draft's uid.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -902,6 +957,20 @@ TOOLS = [
             "required": ["to", "subject", "body"],
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "delete_draft",
+        "description": (
+            "Delete a draft by UID (from create_draft's result, or search_emails with folder='Drafts'). "
+            "Only ever acts on the Drafts folder and refuses anything not flagged as a draft. The draft is "
+            "moved to Trash, so it stays recoverable from there."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"uid": {"type": "string", "description": "UID within the Drafts folder"}},
+            "required": ["uid"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
     },
 ]
 
@@ -983,6 +1052,8 @@ def dispatch_tool(cfg, name, args):
         return imap_reply(cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False))
     if name == "create_draft":
         return imap_create_draft(cfg, args["to"], args["subject"], args["body"], args.get("cc"))
+    if name == "delete_draft":
+        return imap_delete_draft(cfg, args["uid"])
     raise RuntimeError(f"unknown tool {name!r}")
 
 
