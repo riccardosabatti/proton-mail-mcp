@@ -25,10 +25,14 @@ import imaplib
 import smtplib
 import datetime
 import base64
+import copy
+import mimetypes
 import subprocess
 import tempfile
 import shutil
-from email import message_from_bytes
+from email import encoders, message_from_bytes
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, parseaddr, getaddresses, parsedate_to_datetime
 
@@ -55,6 +59,7 @@ VIEW_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024  # inline preview cap — above this
 ALLOWED_IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 PDF_MAX_PAGES = 5  # cap on how many rendered pages one view_attachment call will return
 PDF_RENDER_DPI = 150  # legible for text-heavy documents (e.g. invoices) without ballooning PNG size
+MAX_ATTACHMENTS_TOTAL_BYTES = 25 * 1024 * 1024  # Proton's per-message attachment limit
 
 
 def log(msg):
@@ -400,13 +405,25 @@ def _extract_body(msg):
         return text
 
 
+def _part_filename(part):
+    name = " ".join((part.get_filename() or "").split())  # un-fold a wrapped RFC 2231 filename header
+    # Bridge rebuilds non-ASCII attachment names as RFC 2047 encoded-words inside the filename
+    # parameter (verified: "fattura città.txt" comes back as "=?utf-8?q?fattura_citt=C3=A0.txt?="),
+    # which get_filename() leaves encoded.
+    if "=?" in name:
+        try:
+            return _decode_header_value(name)
+        except Exception:
+            pass
+    return name
+
+
 def _attachment_list(msg):
     names = []
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_disposition() == "attachment":
-                name = part.get_filename() or "(unnamed)"
-                names.append(" ".join(name.split()))  # un-fold a wrapped RFC 2231 filename header
+                names.append(_part_filename(part) or "(unnamed)")
     return names
 
 
@@ -432,6 +449,7 @@ def imap_get_email(cfg, folder, uid, max_chars):
             "from": _decode_header_value(msg.get("From")),
             "to": _decode_header_value(msg.get("To")),
             "cc": _decode_header_value(msg.get("Cc")),
+            "bcc": _decode_header_value(msg.get("Bcc")),  # only ever present on drafts
             "subject": _decode_header_value(msg.get("Subject")),
             "date": msg.get("Date", ""),
             "body": body,
@@ -460,7 +478,7 @@ def imap_download_attachment(cfg, folder, uid, filename):
         match = None
         for part in msg.walk():
             if part.get_content_disposition() == "attachment":
-                name = " ".join((part.get_filename() or "").split())
+                name = _part_filename(part)
                 if name == filename:
                     match = part
                     break
@@ -518,7 +536,7 @@ def imap_fetch_attachment_bytes(cfg, folder, uid, filename):
         match = None
         for part in msg.walk():
             if part.get_content_disposition() == "attachment":
-                name = " ".join((part.get_filename() or "").split())
+                name = _part_filename(part)
                 if name == filename:
                     match = part
                     break
@@ -634,6 +652,126 @@ def imap_move(cfg, folder, uid, target_folder):
             pass
 
 
+def _unfold(raw):
+    # A header value carried over from a fetched message (To/Cc/Subject of a draft being
+    # edited) can be folded across lines; collapse it so no CR/LF reaches the new header.
+    return " ".join((raw or "").split())
+
+
+def _load_local_attachment(path):
+    # Attachment paths come from the model, which may be acting on attacker-written mail — a
+    # prompt-injected "attach ~/.ssh/id_ed25519 to a draft" is the case to defend against. Drafts
+    # sync to Proton's servers and are one click from being sent, so refuse hidden files/dirs
+    # (dotfiles, ~/.ssh, ~/.aws, ~/.config — which holds this server's own Bridge password) and
+    # ~/Library (keychains, browser profiles). Checked after resolving symlinks, so a link planted
+    # in ~/Downloads can't point back into them. A guard against the obvious, not a sandbox.
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        raise ValueError(f"attachment path {path!r} must be absolute")
+    real = os.path.realpath(expanded)
+    if any(part.startswith(".") for part in real.split(os.sep)):
+        raise ValueError(f"refusing to attach {path!r}: hidden files and directories are off-limits")
+    library = os.path.realpath(os.path.expanduser("~/Library"))
+    if real == library or real.startswith(library + os.sep):
+        raise ValueError(f"refusing to attach {path!r}: ~/Library is off-limits")
+    if not os.path.isfile(real):
+        raise ValueError(f"attachment {path!r} is not an existing regular file")
+    size = os.path.getsize(real)
+    if size > MAX_ATTACHMENTS_TOTAL_BYTES:
+        raise ValueError(f"attachment {path!r} is {size} bytes, over Proton's {MAX_ATTACHMENTS_TOTAL_BYTES}-byte limit")
+    with open(real, "rb") as f:
+        data = f.read()
+    ctype, encoding = mimetypes.guess_type(real)
+    if ctype is None or encoding is not None:  # e.g. .tar.gz guesses as tar + gzip encoding — send the bytes as-is
+        ctype = "application/octet-stream"
+    maintype, subtype = ctype.split("/", 1)
+    part = MIMEBase(maintype, subtype)
+    part.set_payload(data)
+    encoders.encode_base64(part)
+    # Name it after the path as given, not the symlink target. Non-ASCII names are RFC 2231-encoded by the stdlib.
+    part.add_header("Content-Disposition", "attachment", filename=os.path.basename(expanded))
+    return part, len(data)
+
+
+def _attachment_parts(paths, already_bytes=0):
+    if isinstance(paths, str):
+        paths = [paths]
+    parts, total = [], already_bytes
+    for p in paths or []:
+        part, size = _load_local_attachment(p)
+        total += size
+        if total > MAX_ATTACHMENTS_TOTAL_BYTES:
+            raise ValueError(f"attachments total {total} bytes, over Proton's {MAX_ATTACHMENTS_TOTAL_BYTES}-byte per-message limit")
+        parts.append(part)
+    return parts
+
+
+def _compose(cfg, to, subject, body_parts, cc=None, bcc=None, attachments=(), extra_headers=(), from_header=None):
+    parts = list(body_parts) + list(attachments)
+    if not parts:
+        parts = [MIMEText("", "plain", "utf-8")]
+    if len(parts) == 1:
+        msg = parts[0]
+    else:
+        msg = MIMEMultipart("mixed")
+        for p in parts:
+            msg.attach(p)
+    if "MIME-Version" not in msg:  # a body part carried over from a multipart draft has none of its own
+        msg["MIME-Version"] = "1.0"
+    msg["Subject"] = subject
+    msg["From"] = from_header or cfg["email"]
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    if bcc:  # only ever set on drafts — Bridge reads it to fill the draft's BCC list
+        msg["Bcc"] = bcc
+    for name, value in extra_headers:
+        if value:
+            msg[name] = value
+    return msg
+
+
+def _append_draft(conn, msg):
+    # Bridge turns an APPEND into Drafts into a real Proton draft (CreateDraft + one
+    # UploadAttachment per attachment part — proton-bridge imapservice/connector.go,
+    # createDraftWithParser). as_bytes(), not as_string(): a body part carried over from a
+    # fetched draft can hold raw 8-bit bytes that only round-trip through the bytes generator.
+    status, data = conn.append(_imap_quote(DRAFTS_FOLDER), "(\\Draft)", None, msg.as_bytes())
+    if status != "OK":
+        raise RuntimeError(f"IMAP APPEND failed: {data}")
+    # UIDPLUS (RFC 4315) reports the new message's UID as `[APPENDUID <validity> <uid>]` —
+    # hand it back so the caller can edit/delete the draft without a search round trip.
+    m = re.search(rb"APPENDUID \d+ (\d+)", data[0] or b"") if data else None
+    return m.group(1).decode() if m else None
+
+
+def _draft_result(uid, msg):
+    result = {
+        "folder": DRAFTS_FOLDER,
+        "to": _decode_header_value(msg.get("To")),
+        "cc": _decode_header_value(msg.get("Cc")),
+        "bcc": _decode_header_value(msg.get("Bcc")),
+        "subject": _decode_header_value(msg.get("Subject")),
+        "attachments": _attachment_list(msg),
+    }
+    if uid:
+        result["uid"] = uid
+    return result
+
+
+def _fetch_draft(conn, uid, section):
+    # The Drafts folder must already be selected. Refuses anything not flagged \Draft, so a
+    # draft tool can never be turned on real mail that ended up in Drafts.
+    status, data = conn.uid("FETCH", uid, f"(FLAGS {section})")
+    if status != "OK" or not data or not isinstance(data[0], tuple):
+        raise RuntimeError(f"no draft with uid {uid} in {DRAFTS_FOLDER!r} (find it via search_emails with folder='Drafts')")
+    # FLAGS can come before or after the literal depending on the server.
+    meta = b" ".join([data[0][0]] + [x for x in data[1:] if isinstance(x, bytes)]).decode(errors="replace")
+    if "\\Draft" not in meta:
+        raise RuntimeError(f"uid {uid} in {DRAFTS_FOLDER!r} is not flagged \\Draft — refusing to touch it")
+    return message_from_bytes(data[0][1])
+
+
 def _smtp_deliver(cfg, msg, all_recipients):
     # Unlike Bridge's IMAP (plaintext + STARTTLS), its SMTP port expects TLS
     # from the first byte (implicit TLS, like SMTPS) — STARTTLS here just hangs
@@ -658,6 +796,43 @@ def smtp_send(cfg, to, subject, body, cc, bcc):
     return {"sent_to": all_recipients, "subject": subject}
 
 
+def _reply_fields(cfg, orig, body, reply_all):
+    orig_subject = _decode_header_value(orig.get("Subject"))
+    orig_subject = orig_subject.replace("\r", " ").replace("\n", " ")  # a malformed inbound header must not carry into our outgoing one
+    reply_subject = orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
+
+    orig_from = orig.get("From", "")
+    to_addrs = [orig_from] if orig_from else []
+    cc_addrs = []
+    if reply_all:
+        self_email = cfg["email"].lower()
+        orig_from_addr = parseaddr(orig_from)[1].lower()
+        already = {parseaddr(orig_from)[1].lower()}
+        for n, a in getaddresses([orig.get("To", "")]):
+            if a and a.lower() not in (self_email, orig_from_addr) and a.lower() not in already:
+                to_addrs.append(formataddr((n, a)))
+                already.add(a.lower())
+        for n, a in getaddresses([orig.get("Cc", "")]):
+            if a and a.lower() not in (self_email, orig_from_addr) and a.lower() not in already:
+                cc_addrs.append(formataddr((n, a)))
+                already.add(a.lower())
+
+    orig_msgid = orig.get("Message-ID", "")
+    orig_refs = orig.get("References", "")
+    references = f"{orig_refs} {orig_msgid}".strip() if orig_refs else orig_msgid
+
+    orig_body = _extract_body(orig)
+    quoted = "\n".join(f"> {line}" for line in orig_body.splitlines())
+    return {
+        "subject": reply_subject,
+        "to": ", ".join(to_addrs),
+        "cc": ", ".join(cc_addrs),
+        "body": f"{body}\n\nOn {orig.get('Date', '')}, {orig_from} wrote:\n{quoted}",
+        "threading": (("In-Reply-To", orig_msgid), ("References", references)),
+        "in_reply_to": orig_msgid,
+    }
+
+
 def imap_reply(cfg, folder, uid, body, reply_all):
     uid = _validate_uid(uid)
     conn = imap_connect(cfg)
@@ -670,48 +845,10 @@ def imap_reply(cfg, folder, uid, body, reply_all):
             raise RuntimeError(f"message uid {uid} not found in {folder!r}")
         orig = message_from_bytes(msg_data[0][1])
 
-        orig_subject = _decode_header_value(orig.get("Subject"))
-        orig_subject = orig_subject.replace("\r", " ").replace("\n", " ")  # a malformed inbound header must not carry into our outgoing one
-        reply_subject = orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
+        r = _reply_fields(cfg, orig, body, reply_all)
+        msg = _compose(cfg, r["to"], r["subject"], [MIMEText(r["body"], "plain", "utf-8")], r["cc"], extra_headers=r["threading"])
 
-        orig_from = orig.get("From", "")
-        to_addrs = [orig_from] if orig_from else []
-        cc_addrs = []
-        if reply_all:
-            self_email = cfg["email"].lower()
-            orig_from_addr = parseaddr(orig_from)[1].lower()
-            already = {parseaddr(orig_from)[1].lower()}
-            for n, a in getaddresses([orig.get("To", "")]):
-                if a and a.lower() not in (self_email, orig_from_addr) and a.lower() not in already:
-                    to_addrs.append(formataddr((n, a)))
-                    already.add(a.lower())
-            for n, a in getaddresses([orig.get("Cc", "")]):
-                if a and a.lower() not in (self_email, orig_from_addr) and a.lower() not in already:
-                    cc_addrs.append(formataddr((n, a)))
-                    already.add(a.lower())
-        to_header = ", ".join(to_addrs)
-        cc_header = ", ".join(cc_addrs)
-
-        orig_msgid = orig.get("Message-ID", "")
-        orig_refs = orig.get("References", "")
-        references = f"{orig_refs} {orig_msgid}".strip() if orig_refs else orig_msgid
-
-        orig_body = _extract_body(orig)
-        quoted = "\n".join(f"> {line}" for line in orig_body.splitlines())
-        full_body = f"{body}\n\nOn {orig.get('Date', '')}, {orig_from} wrote:\n{quoted}"
-
-        msg = MIMEText(full_body, "plain", "utf-8")
-        msg["Subject"] = reply_subject
-        msg["From"] = cfg["email"]
-        msg["To"] = to_header
-        if cc_header:
-            msg["Cc"] = cc_header
-        if orig_msgid:
-            msg["In-Reply-To"] = orig_msgid
-        if references:
-            msg["References"] = references
-
-        all_recipients = [addr for _, addr in _addr_list(to_header, cc_header) if addr]
+        all_recipients = [addr for _, addr in _addr_list(r["to"], r["cc"]) if addr]
         _smtp_deliver(cfg, msg, all_recipients)
 
         try:
@@ -719,7 +856,7 @@ def imap_reply(cfg, folder, uid, body, reply_all):
         except Exception:
             pass  # best-effort — the reply already went out, don't fail the tool over a flag
 
-        return {"sent_to": all_recipients, "subject": reply_subject, "in_reply_to": orig_msgid}
+        return {"sent_to": all_recipients, "subject": r["subject"], "in_reply_to": r["in_reply_to"]}
     finally:
         try:
             conn.logout()
@@ -727,26 +864,125 @@ def imap_reply(cfg, folder, uid, body, reply_all):
             pass
 
 
-def imap_create_draft(cfg, to, subject, body, cc):
-    for field, value in (("to", to), ("subject", subject), ("cc", cc)):
+def imap_create_draft(cfg, to, subject, body, cc, bcc, attachments):
+    for field, value in (("to", to), ("subject", subject), ("cc", cc), ("bcc", bcc)):
         _reject_crlf(value, field)
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = cfg["email"]
-    msg["To"] = to
-    if cc:
-        msg["Cc"] = cc
+    msg = _compose(cfg, to, subject, [MIMEText(body, "plain", "utf-8")], cc, bcc, _attachment_parts(attachments))
     conn = imap_connect(cfg)
     try:
-        status, data = conn.append(_imap_quote(DRAFTS_FOLDER), "(\\Draft)", None, msg.as_string().encode("utf-8"))
+        return _draft_result(_append_draft(conn, msg), msg)
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def imap_create_reply_draft(cfg, folder, uid, body, reply_all, attachments):
+    uid = _validate_uid(uid)
+    att_parts = _attachment_parts(attachments)
+    conn = imap_connect(cfg)
+    try:
+        status, _ = conn.select(_imap_quote(folder), readonly=True)
         if status != "OK":
-            raise RuntimeError(f"IMAP APPEND failed: {data}")
-        result = {"folder": DRAFTS_FOLDER, "to": to, "subject": subject}
-        # UIDPLUS (RFC 4315) reports the new message's UID as `[APPENDUID <validity> <uid>]` —
-        # hand it back so the caller can delete_draft it without a search round trip.
-        m = re.search(rb"APPENDUID \d+ (\d+)", data[0] or b"") if data else None
-        if m:
-            result["uid"] = m.group(1).decode()
+            raise RuntimeError(f"cannot open folder {folder!r}")
+        orig, _flags = _fetch_full(conn, uid)
+        if orig is None:
+            raise RuntimeError(f"message uid {uid} not found in {folder!r}")
+        r = _reply_fields(cfg, orig, body, reply_all)
+        # Bridge drops In-Reply-To/References here: it creates the draft through Proton's API
+        # with no ParentID (verified live and in createDraftWithParser), so the draft is not
+        # linked to the original conversation. Set anyway — it's what a mail client would send.
+        msg = _compose(
+            cfg, r["to"], r["subject"], [MIMEText(r["body"], "plain", "utf-8")], r["cc"],
+            attachments=att_parts, extra_headers=r["threading"],
+        )
+        result = _draft_result(_append_draft(conn, msg), msg)
+        result["in_reply_to"] = r["in_reply_to"]
+        return result
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def _content_only(part):
+    # A part carried over into an edited draft keeps only its Content-* headers. When the
+    # draft is single-part the "part" is the whole fetched message, whose headers include
+    # Bridge's X-Pm-Internal-Id — which Bridge uses to recognize an APPEND as a copy of an
+    # existing message. The new version has to look like a brand-new message.
+    part = copy.deepcopy(part)
+    for k in set(part.keys()):
+        if not k.lower().startswith("content-") and k.lower() != "mime-version":
+            del part[k]
+    return part
+
+
+def imap_update_draft(cfg, uid, to, subject, body, cc, bcc, attachments, remove_attachments):
+    # IMAP messages are immutable, so "edit in place" = APPEND the new version, then move
+    # the old one to Trash (recoverable, same as delete_draft). APPEND first, so a failure
+    # in between leaves two drafts rather than none.
+    uid = _validate_uid(uid)
+    for field, value in (("to", to), ("subject", subject), ("cc", cc), ("bcc", bcc)):
+        _reject_crlf(value, field)
+    if isinstance(remove_attachments, str):
+        remove_attachments = [remove_attachments]
+    conn = imap_connect(cfg)
+    try:
+        status, _ = conn.select(_imap_quote(DRAFTS_FOLDER), readonly=False)
+        if status != "OK":
+            raise RuntimeError(f"cannot open folder {DRAFTS_FOLDER!r}")
+        old = _fetch_draft(conn, uid, "BODY.PEEK[]")
+
+        # Bridge serves drafts flat: a single body part, or multipart/mixed of body part(s)
+        # followed by attachments (verified on live drafts, incl. HTML ones from the web app).
+        children = old.get_payload() if old.get_content_type() == "multipart/mixed" else [old]
+        body_parts = [p for p in children if p.get_content_disposition() != "attachment"]
+        kept = [p for p in children if p.get_content_disposition() == "attachment"]
+        names = [_part_filename(p) or "(unnamed)" for p in kept]
+        drop = {" ".join(n.split()) for n in (remove_attachments or [])}
+        if drop - set(names):
+            raise RuntimeError(f"no attachment(s) {sorted(drop - set(names))} on draft uid {uid} — available: {names}")
+        body_parts = [MIMEText(body, "plain", "utf-8")] if body is not None else [_content_only(p) for p in body_parts]
+        carried = []
+        for p, n in zip(kept, names):
+            if n in drop:
+                continue
+            p = _content_only(p)
+            if p.get_filename():
+                # Re-state the decoded name rather than hand Bridge back its own RFC 2047-in-a-parameter
+                # form, which isn't standard and would risk the literal "=?utf-8?q?…?=" becoming the name.
+                del p["Content-Disposition"]
+                p.add_header("Content-Disposition", "attachment", filename=n)
+                p.del_param("name")
+            carried.append(p)
+        kept = carried
+        kept_bytes = sum(len(p.get_payload(decode=True) or b"") for p in kept)
+        new_parts = _attachment_parts(attachments, kept_bytes)
+
+        msg = _compose(
+            cfg,
+            to if to is not None else _unfold(old.get("To")),
+            subject if subject is not None else _unfold(old.get("Subject")),
+            body_parts,
+            cc if cc is not None else _unfold(old.get("Cc")),
+            bcc if bcc is not None else _unfold(old.get("Bcc")),
+            kept + new_parts,
+            extra_headers=(("In-Reply-To", _unfold(old.get("In-Reply-To"))), ("References", _unfold(old.get("References")))),
+            from_header=_unfold(old.get("From")) or None,  # keep the sending address/alias the draft already had
+        )
+        new_uid = _append_draft(conn, msg)
+        try:
+            _uid_move(conn, uid, TRASH_FOLDER)
+        except Exception as e:
+            raise RuntimeError(
+                f"saved the edited draft as uid {new_uid}, but could not move the old version (uid {uid}) "
+                f"to {TRASH_FOLDER}: {e} — both versions are now in {DRAFTS_FOLDER}"
+            )
+        result = _draft_result(new_uid, msg)
+        result["previous_uid"] = uid
+        result["previous_moved_to"] = TRASH_FOLDER
         return result
     finally:
         try:
@@ -767,14 +1003,7 @@ def imap_delete_draft(cfg, uid):
         status, _ = conn.select(_imap_quote(DRAFTS_FOLDER), readonly=False)
         if status != "OK":
             raise RuntimeError(f"cannot open folder {DRAFTS_FOLDER!r}")
-        status, data = conn.uid("FETCH", uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (TO SUBJECT DATE)])")
-        if status != "OK" or not data or not isinstance(data[0], tuple):
-            raise RuntimeError(f"no draft with uid {uid} in {DRAFTS_FOLDER!r} (find it via search_emails with folder='Drafts')")
-        # FLAGS can come before or after the header literal depending on the server.
-        meta = b" ".join([data[0][0]] + [x for x in data[1:] if isinstance(x, bytes)]).decode(errors="replace")
-        if "\\Draft" not in meta:
-            raise RuntimeError(f"uid {uid} in {DRAFTS_FOLDER!r} is not flagged \\Draft — refusing to delete it")
-        hdr = message_from_bytes(data[0][1])
+        hdr = _fetch_draft(conn, uid, "BODY.PEEK[HEADER.FIELDS (TO SUBJECT DATE)]")
         _uid_move(conn, uid, TRASH_FOLDER)
         return {
             "uid": uid,
@@ -789,6 +1018,15 @@ def imap_delete_draft(cfg, uid):
         except Exception:
             pass
 
+
+ATTACHMENTS_SCHEMA = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "absolute paths of local files to attach; hidden files/directories and ~/Library are refused, "
+        f"and attachments may total at most {MAX_ATTACHMENTS_TOTAL_BYTES // (1024 * 1024)} MB"
+    ),
+}
 
 TOOLS = [
     {
@@ -945,7 +1183,7 @@ TOOLS = [
     },
     {
         "name": "create_draft",
-        "description": "Save an email as a draft in the Drafts folder without sending it. Returns the new draft's uid.",
+        "description": "Save an email as a draft in the Drafts folder without sending it, optionally with local files attached. Returns the new draft's uid.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -953,10 +1191,66 @@ TOOLS = [
                 "subject": {"type": "string"},
                 "body": {"type": "string"},
                 "cc": {"type": "string"},
+                "bcc": {"type": "string"},
+                "attachments": ATTACHMENTS_SCHEMA,
             },
             "required": ["to", "subject", "body"],
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "create_reply_draft",
+        "description": (
+            "Save a reply to an email as a draft instead of sending it: 'Re:' subject, addressed to the sender "
+            "(or everyone with reply_all), original quoted below — same as reply_to_email, but into Drafts. "
+            "Returns the draft's uid. Caveat: Proton Bridge does not link drafts saved over IMAP to the original "
+            "conversation (it drops In-Reply-To/References), so in Proton the draft sits in its own thread and, "
+            "if sent from the Proton app, may not thread for the recipient. Use reply_to_email when the reply "
+            "should go out now, properly threaded."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uid": {"type": "string", "description": "UID of the message being replied to"},
+                "folder": {"type": "string", "default": "INBOX"},
+                "body": {"type": "string"},
+                "reply_all": {"type": "boolean", "default": False},
+                "attachments": ATTACHMENTS_SCHEMA,
+            },
+            "required": ["uid", "body"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "update_draft",
+        "description": (
+            "Edit an existing draft (uid from create_draft/create_reply_draft, or search_emails with folder='Drafts'; "
+            "read it first with get_email folder='Drafts'). Only the fields you pass change — recipients, subject, "
+            "body (incl. HTML formatting) and attachments are otherwise carried over. `body` replaces the whole body "
+            "as plain text; `attachments` adds files, `remove_attachments` drops existing ones by name. IMAP messages "
+            "are immutable, so this saves a new version and moves the old one to Trash: the draft gets a NEW uid "
+            "(returned) — use it for any further edit. A draft started as a reply in the Proton app loses its link "
+            "to that conversation (Bridge limitation)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uid": {"type": "string", "description": "UID within the Drafts folder"},
+                "to": {"type": "string", "description": "replaces the To list"},
+                "cc": {"type": "string", "description": "replaces the Cc list (empty string clears it)"},
+                "bcc": {"type": "string", "description": "replaces the Bcc list (empty string clears it)"},
+                "subject": {"type": "string"},
+                "body": {"type": "string", "description": "replaces the whole body, as plain text"},
+                "attachments": ATTACHMENTS_SCHEMA,
+                "remove_attachments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "filenames to drop, exactly as in get_email's attachments list",
+                },
+            },
+            "required": ["uid"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
     },
     {
         "name": "delete_draft",
@@ -1051,7 +1345,25 @@ def dispatch_tool(cfg, name, args):
     if name == "reply_to_email":
         return imap_reply(cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False))
     if name == "create_draft":
-        return imap_create_draft(cfg, args["to"], args["subject"], args["body"], args.get("cc"))
+        return imap_create_draft(
+            cfg, args["to"], args["subject"], args["body"], args.get("cc"), args.get("bcc"), args.get("attachments")
+        )
+    if name == "create_reply_draft":
+        return imap_create_reply_draft(
+            cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False), args.get("attachments")
+        )
+    if name == "update_draft":
+        return imap_update_draft(
+            cfg,
+            args["uid"],
+            args.get("to"),
+            args.get("subject"),
+            args.get("body"),
+            args.get("cc"),
+            args.get("bcc"),
+            args.get("attachments"),
+            args.get("remove_attachments"),
+        )
     if name == "delete_draft":
         return imap_delete_draft(cfg, args["uid"])
     raise RuntimeError(f"unknown tool {name!r}")

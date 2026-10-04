@@ -68,7 +68,9 @@ Each account gets its own config file (so its own file permissions and blast rad
 | `mark_read` | no | toggles `\Seen`, reversible |
 | `move_email` | no | to an existing folder/label |
 | `reply_to_email` | no | threads via In-Reply-To/References, quotes the original |
-| `create_draft` | no | saves without sending, returns the new draft's UID |
+| `create_draft` | no | saves without sending (to/cc/bcc, optional local attachments), returns the new draft's UID |
+| `create_reply_draft` | no | like `reply_to_email` but saved to Drafts instead of sent — see [Drafts](#drafts) for the threading caveat |
+| `update_draft` | no | edits a draft: only the fields passed change, the rest (incl. HTML body and attachments) is carried over; returns the draft's **new** UID |
 | `delete_draft` | no | Drafts folder only, refuses anything not flagged `\Draft`; moves to Trash (recoverable) instead of expunging, since Bridge turns an expunge from Drafts into a permanent delete |
 | `send_email` | no | |
 
@@ -82,10 +84,22 @@ Results are ranked by the message's actual `Date` header, not IMAP UID — Bridg
 
 `has_attachment` has no native IMAP search key to lean on, so it scans messages newest-first (real-date order) up to `scan_cap` (default 300, raise it if `scan_capped` comes back `true` and you need older matches) — unbounded scanning over a large mailbox with no other filter would be slow, so this is a deliberate, visible cap rather than a silent one. It fetches the full message (not just `BODYSTRUCTURE`) to check for attachments, trading some bandwidth for reusing Python's own well-tested MIME parser instead of hand-rolling an IMAP `BODYSTRUCTURE` parser (the stdlib has none) — fine over loopback, but worth knowing if you raise `scan_cap` a lot.
 
+### Drafts
+
+How Proton Bridge treats drafts shapes these tools (read in `proton-bridge` `internal/services/imapservice/connector.go`, then verified live):
+
+- An IMAP `APPEND` into `Drafts` becomes a real Proton draft: Bridge calls Proton's CreateDraft API (subject, body, To/Cc/**Bcc**) and uploads every attachment part. So attaching a file = putting it in the appended MIME message.
+- Messages in IMAP are immutable, so `update_draft` saves a new version and moves the old one to Trash — the draft's UID changes on every edit (the new one is returned). The old version is never expunged: Bridge turns an expunge out of Drafts/Trash into a permanent server-side delete. The new version is built from scratch, never by re-appending fetched bytes: Bridge stamps fetched messages with `X-Pm-Internal-Id`, which it uses to recognize a re-`APPEND`ed copy of an existing message.
+- Bridge creates drafts with **no `ParentID`** and drops `In-Reply-To`/`References`, so a draft from `create_reply_draft` is not linked to the original conversation: in Proton it sits in its own thread, and if sent from the Proton app it may not thread for the recipient. There is no way around this over IMAP. `reply_to_email` (SMTP) doesn't have the problem: Bridge's SMTP path does resolve the parent from those headers. For the same reason, editing a draft that was started as a reply in the Proton app unlinks it.
+- Bridge serves non-ASCII attachment names as RFC 2047 encoded-words inside the `filename` parameter (`=?utf-8?q?fattura_citt=C3=A0.txt?=`), which Python's `get_filename()` leaves encoded; names are decoded before being listed or matched.
+
+Attachments are read from local paths given by the model, which may be acting on attacker-written mail, so paths must be absolute, and hidden files/directories (dotfiles, `~/.ssh`, `~/.config` — including this server's own config) and `~/Library` are refused after resolving symlinks. Total attachment size is capped at Proton's 25 MB per message. It's a guard against the obvious prompt-injection ("attach ~/.ssh/id_ed25519"), not a sandbox.
+
 ## Security model
 
 - The server only ever talks to Bridge on `127.0.0.1` — no other network activity.
 - The Bridge password lives only in `~/.config/proton-mcp/config.json` (mode `600`), read once at startup. It is never logged, never included in error messages, never written anywhere else.
+- Draft attachments can only be read from absolute, non-hidden paths outside `~/Library` (see [Drafts](#drafts)); attaching is only offered on drafts, so a file never leaves the account without first sitting in Drafts.
 - TLS to Bridge's loopback IMAP/SMTP is left unverified by default (Bridge issues a fresh self-signed cert per install; there's no network path for a MITM on loopback, so this is a deliberate, scoped exception, not a blanket bypass). If you want strict verification anyway, export Bridge's cert (Bridge → Settings → Export TLS certificate) and set `tls_cert_path` in the config.
 
 ## Implementation notes
