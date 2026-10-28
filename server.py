@@ -30,6 +30,9 @@ import mimetypes
 import subprocess
 import tempfile
 import shutil
+import time
+import urllib.parse
+import urllib.request
 from email import encoders, message_from_bytes
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -68,18 +71,54 @@ def log(msg):
 
 
 def load_config():
+    global SERVER_NAME, DEFAULT_SEARCH_FOLDER, DRAFTS_FOLDER, TRASH_FOLDER
     with open(CONFIG_PATH, "r") as f:
         cfg = json.load(f)
-    missing = [k for k in ("email", "bridge_password") if not cfg.get(k)]
+    # auth "xoauth2" (Gmail / Google Workspace): an OAuth refresh token instead of a
+    # Bridge password. The token's account must be `email`.
+    secret = ("oauth_client_id", "oauth_client_secret", "oauth_refresh_token") if cfg.get("auth") == "xoauth2" \
+        else ("bridge_password",)
+    missing = [k for k in ("email",) + secret if not cfg.get(k)]
     if missing:
         raise RuntimeError(
             f"config missing {missing} — fill in {CONFIG_PATH} (chmod 600) before connecting a client"
         )
+    # Folder names differ per server (Gmail: "[Gmail]/Tutti i messaggi", "[Gmail]/Bozze"
+    # ... in the account's language): `folders` in the config overrides Bridge's.
+    folders = cfg.get("folders") or {}
+    DEFAULT_SEARCH_FOLDER = folders.get("all", DEFAULT_SEARCH_FOLDER)
+    DRAFTS_FOLDER = folders.get("drafts", DRAFTS_FOLDER)
+    TRASH_FOLDER = folders.get("trash", TRASH_FOLDER)
+    SERVER_NAME = cfg.get("server_name", SERVER_NAME)
     return cfg
+
+
+_oauth = {"token": None, "expires": 0.0}
+
+
+def _oauth_token(cfg):
+    """Access token from the refresh token, cached until a minute before it expires."""
+    if _oauth["token"] and time.time() < _oauth["expires"] - 60:
+        return _oauth["token"]
+    body = urllib.parse.urlencode({
+        "client_id": cfg["oauth_client_id"], "client_secret": cfg["oauth_client_secret"],
+        "refresh_token": cfg["oauth_refresh_token"], "grant_type": "refresh_token",
+    }).encode()
+    with urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=body),
+                                timeout=CONNECT_TIMEOUT) as r:
+        j = json.load(r)
+    _oauth["token"], _oauth["expires"] = j["access_token"], time.time() + int(j.get("expires_in", 3600))
+    return _oauth["token"]
+
+
+def _xoauth2(cfg):
+    return f"user={cfg['email']}\x01auth=Bearer {_oauth_token(cfg)}\x01\x01"
 
 
 def make_ssl_context(cfg):
     ctx = ssl.create_default_context()
+    if cfg.get("tls_verify"):  # a real server (Gmail): normal certificate checks
+        return ctx
     cert_path = cfg.get("tls_cert_path")
     if cert_path:
         ctx.load_verify_locations(cafile=cert_path)
@@ -97,9 +136,15 @@ CONNECT_TIMEOUT = 15
 
 def imap_connect(cfg):
     ctx = make_ssl_context(cfg)
-    conn = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"], timeout=CONNECT_TIMEOUT)
-    conn.starttls(ssl_context=ctx)
-    conn.login(cfg["email"], cfg["bridge_password"])
+    if cfg.get("imap_ssl"):  # implicit TLS (imap.gmail.com:993)
+        conn = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"], ssl_context=ctx, timeout=CONNECT_TIMEOUT)
+    else:
+        conn = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"], timeout=CONNECT_TIMEOUT)
+        conn.starttls(ssl_context=ctx)
+    if cfg.get("auth") == "xoauth2":
+        conn.authenticate("XOAUTH2", lambda _: _xoauth2(cfg).encode())
+    else:
+        conn.login(cfg["email"], cfg["bridge_password"])
     # imaplib caches CAPABILITY from before login and never refreshes it, but Bridge
     # only advertises MOVE/UIDPLUS once authenticated (verified) — without this
     # re-read every `"MOVE" in conn.capabilities` check silently takes the fallback.
@@ -271,7 +316,14 @@ def _uid_fetch_dates(conn, uids, chunk_size=500):
         pending_header = None
         for item in msg_data:
             if isinstance(item, tuple):
-                pending_header = item[1]
+                # Gmail puts the UID before the literal ("1 (UID 13 BODY[...] {40}"),
+                # Bridge after it (the next b" UID 13)" item).
+                m = uid_re.search(item[0])
+                if m:
+                    dates[m.group(1).decode()] = _parse_date(message_from_bytes(item[1]).get("Date", ""))
+                    pending_header = None
+                else:
+                    pending_header = item[1]
                 continue
             m = uid_re.search(item) if isinstance(item, bytes) else None
             if m and pending_header is not None:
@@ -706,6 +758,10 @@ def _attachment_parts(paths, already_bytes=0):
     return parts
 
 
+def _from_addr(cfg):
+    return parseaddr(cfg.get("from") or cfg["email"])[1] or cfg["email"]
+
+
 def _compose(cfg, to, subject, body_parts, cc=None, bcc=None, attachments=(), extra_headers=(), from_header=None):
     parts = list(body_parts) + list(attachments)
     if not parts:
@@ -719,7 +775,7 @@ def _compose(cfg, to, subject, body_parts, cc=None, bcc=None, attachments=(), ex
     if "MIME-Version" not in msg:  # a body part carried over from a multipart draft has none of its own
         msg["MIME-Version"] = "1.0"
     msg["Subject"] = subject
-    msg["From"] = from_header or cfg["email"]
+    msg["From"] = from_header or cfg.get("from") or cfg["email"]
     msg["To"] = to
     if cc:
         msg["Cc"] = cc
@@ -777,6 +833,15 @@ def _smtp_deliver(cfg, msg, all_recipients):
     # from the first byte (implicit TLS, like SMTPS) — STARTTLS here just hangs
     # waiting for a plaintext greeting that never comes, until it times out.
     ctx = make_ssl_context(cfg)
+    if cfg.get("auth") == "xoauth2":  # Gmail: STARTTLS on 587, then XOAUTH2
+        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=CONNECT_TIMEOUT) as server:
+            server.starttls(context=ctx)
+            server.ehlo()
+            code, resp = server.docmd("AUTH", "XOAUTH2 " + base64.b64encode(_xoauth2(cfg).encode()).decode())
+            if code != 235:
+                raise RuntimeError(f"SMTP XOAUTH2 failed: {code} {resp[:200]!r}")
+            server.sendmail(_from_addr(cfg), all_recipients, msg.as_string())
+        return
     with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"], context=ctx, timeout=CONNECT_TIMEOUT) as server:
         server.login(cfg["email"], cfg["bridge_password"])
         server.sendmail(cfg["email"], all_recipients, msg.as_string())
@@ -787,7 +852,7 @@ def smtp_send(cfg, to, subject, body, cc, bcc):
         _reject_crlf(value, field)
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = cfg["email"]
+    msg["From"] = cfg.get("from") or cfg["email"]
     msg["To"] = to
     if cc:
         msg["Cc"] = cc
@@ -805,15 +870,16 @@ def _reply_fields(cfg, orig, body, reply_all):
     to_addrs = [orig_from] if orig_from else []
     cc_addrs = []
     if reply_all:
-        self_email = cfg["email"].lower()
+        # Our own addresses never get the reply: the account, its `from`, its `aliases`.
+        selves = {cfg["email"].lower(), _from_addr(cfg).lower()} | {a.lower() for a in cfg.get("aliases", [])}
         orig_from_addr = parseaddr(orig_from)[1].lower()
         already = {parseaddr(orig_from)[1].lower()}
         for n, a in getaddresses([orig.get("To", "")]):
-            if a and a.lower() not in (self_email, orig_from_addr) and a.lower() not in already:
+            if a and a.lower() not in selves | {orig_from_addr} and a.lower() not in already:
                 to_addrs.append(formataddr((n, a)))
                 already.add(a.lower())
         for n, a in getaddresses([orig.get("Cc", "")]):
-            if a and a.lower() not in (self_email, orig_from_addr) and a.lower() not in already:
+            if a and a.lower() not in selves | {orig_from_addr} and a.lower() not in already:
                 cc_addrs.append(formataddr((n, a)))
                 already.add(a.lower())
 
