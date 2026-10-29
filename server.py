@@ -762,6 +762,60 @@ def _from_addr(cfg):
     return parseaddr(cfg.get("from") or cfg["email"])[1] or cfg["email"]
 
 
+_send_as = {"addrs": None, "expires": 0.0}
+
+
+def _gmail_send_as(cfg):
+    """Addresses Gmail will put in From: as given (primary + accepted send-as), cached 5 min.
+    Any other From is silently rewritten to the primary address by Gmail."""
+    if _send_as["addrs"] is not None and time.time() < _send_as["expires"]:
+        return _send_as["addrs"]
+    req = urllib.request.Request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs",
+        headers={"Authorization": f"Bearer {_oauth_token(cfg)}"},
+    )
+    with urllib.request.urlopen(req, timeout=CONNECT_TIMEOUT) as r:
+        rows = json.load(r).get("sendAs", [])
+    addrs = {s["sendAsEmail"].lower() for s in rows if s.get("isPrimary") or s.get("verificationStatus") == "accepted"}
+    _send_as["addrs"], _send_as["expires"] = addrs, time.time() + 300
+    return addrs
+
+
+def _pick_from(cfg, requested=None, orig=None):
+    """The From address for an outgoing message, and a note when it had to fall back.
+
+    `requested` must be one of the account's own addresses (login or `aliases`). With
+    none, a reply goes out from the own address the original was sent to (so mail to
+    info@ is answered from info@), anything else from the config's `from`. On Gmail an
+    address that is not an accepted send-as would be rewritten to the login: a requested
+    one is refused, an implicit one falls back to the login and says so."""
+    own = [cfg["email"]] + list(cfg.get("aliases", []))
+    by_lower = {a.lower(): a for a in own}
+    if requested:
+        _reject_crlf(requested, "from")
+        addr = parseaddr(requested)[1].lower()
+        if addr not in by_lower:
+            raise RuntimeError(f"from {requested!r} is not an address of this account — use one of {own}")
+        chosen, explicit = by_lower[addr], True
+    else:
+        chosen, explicit = None, False
+        if orig is not None:
+            for header in ("To", "Cc", "Delivered-To", "X-Original-To"):
+                hit = next((by_lower[a.lower()] for _, a in getaddresses(orig.get_all(header, [])) if a.lower() in by_lower), None)
+                if hit:
+                    chosen = hit
+                    break
+        chosen = chosen or _from_addr(cfg)
+    if cfg.get("auth") != "xoauth2" or chosen.lower() == cfg["email"].lower():
+        return chosen, None
+    if chosen.lower() in _gmail_send_as(cfg):
+        return chosen, None
+    hint = f"{chosen} is not a Gmail send-as address of {cfg['email']} yet (Gmail would rewrite From to {cfg['email']})"
+    if explicit:
+        raise RuntimeError(hint)
+    return cfg["email"], hint + f" — sent from {cfg['email']}"
+
+
 def _compose(cfg, to, subject, body_parts, cc=None, bcc=None, attachments=(), extra_headers=(), from_header=None):
     parts = list(body_parts) + list(attachments)
     if not parts:
@@ -804,6 +858,7 @@ def _append_draft(conn, msg):
 def _draft_result(uid, msg):
     result = {
         "folder": DRAFTS_FOLDER,
+        "from": _decode_header_value(msg.get("From")),
         "to": _decode_header_value(msg.get("To")),
         "cc": _decode_header_value(msg.get("Cc")),
         "bcc": _decode_header_value(msg.get("Bcc")),
@@ -840,25 +895,29 @@ def _smtp_deliver(cfg, msg, all_recipients):
             code, resp = server.docmd("AUTH", "XOAUTH2 " + base64.b64encode(_xoauth2(cfg).encode()).decode())
             if code != 235:
                 raise RuntimeError(f"SMTP XOAUTH2 failed: {code} {resp[:200]!r}")
-            server.sendmail(_from_addr(cfg), all_recipients, msg.as_string())
+            server.sendmail(parseaddr(msg["From"])[1] or _from_addr(cfg), all_recipients, msg.as_string())
         return
     with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"], context=ctx, timeout=CONNECT_TIMEOUT) as server:
         server.login(cfg["email"], cfg["bridge_password"])
         server.sendmail(cfg["email"], all_recipients, msg.as_string())
 
 
-def smtp_send(cfg, to, subject, body, cc, bcc):
+def smtp_send(cfg, to, subject, body, cc, bcc, from_addr=None):
     for field, value in (("to", to), ("subject", subject), ("cc", cc), ("bcc", bcc)):
         _reject_crlf(value, field)
+    sender, note = _pick_from(cfg, from_addr)
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = cfg.get("from") or cfg["email"]
+    msg["From"] = sender
     msg["To"] = to
     if cc:
         msg["Cc"] = cc
     all_recipients = [addr for _, addr in _addr_list(to, cc, bcc) if addr]
     _smtp_deliver(cfg, msg, all_recipients)
-    return {"sent_to": all_recipients, "subject": subject}
+    result = {"from": sender, "sent_to": all_recipients, "subject": subject}
+    if note:
+        result["note"] = note
+    return result
 
 
 def _reply_fields(cfg, orig, body, reply_all):
@@ -899,20 +958,23 @@ def _reply_fields(cfg, orig, body, reply_all):
     }
 
 
-def imap_reply(cfg, folder, uid, body, reply_all):
+def imap_reply(cfg, folder, uid, body, reply_all, from_addr=None):
     uid = _validate_uid(uid)
     conn = imap_connect(cfg)
     try:
         status, _ = conn.select(_imap_quote(folder), readonly=False)
         if status != "OK":
             raise RuntimeError(f"cannot open folder {folder!r}")
-        status, msg_data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
-        if status != "OK" or not msg_data or msg_data[0] is None:
+        orig, _flags = _fetch_full(conn, uid)
+        if orig is None:
             raise RuntimeError(f"message uid {uid} not found in {folder!r}")
-        orig = message_from_bytes(msg_data[0][1])
 
+        sender, note = _pick_from(cfg, from_addr, orig)
         r = _reply_fields(cfg, orig, body, reply_all)
-        msg = _compose(cfg, r["to"], r["subject"], [MIMEText(r["body"], "plain", "utf-8")], r["cc"], extra_headers=r["threading"])
+        msg = _compose(
+            cfg, r["to"], r["subject"], [MIMEText(r["body"], "plain", "utf-8")], r["cc"],
+            extra_headers=r["threading"], from_header=sender,
+        )
 
         all_recipients = [addr for _, addr in _addr_list(r["to"], r["cc"]) if addr]
         _smtp_deliver(cfg, msg, all_recipients)
@@ -922,7 +984,10 @@ def imap_reply(cfg, folder, uid, body, reply_all):
         except Exception:
             pass  # best-effort — the reply already went out, don't fail the tool over a flag
 
-        return {"sent_to": all_recipients, "subject": r["subject"], "in_reply_to": r["in_reply_to"]}
+        result = {"from": sender, "sent_to": all_recipients, "subject": r["subject"], "in_reply_to": r["in_reply_to"]}
+        if note:
+            result["note"] = note
+        return result
     finally:
         try:
             conn.logout()
@@ -930,13 +995,17 @@ def imap_reply(cfg, folder, uid, body, reply_all):
             pass
 
 
-def imap_create_draft(cfg, to, subject, body, cc, bcc, attachments):
+def imap_create_draft(cfg, to, subject, body, cc, bcc, attachments, from_addr=None):
     for field, value in (("to", to), ("subject", subject), ("cc", cc), ("bcc", bcc)):
         _reject_crlf(value, field)
-    msg = _compose(cfg, to, subject, [MIMEText(body, "plain", "utf-8")], cc, bcc, _attachment_parts(attachments))
+    sender, note = _pick_from(cfg, from_addr)
+    msg = _compose(cfg, to, subject, [MIMEText(body, "plain", "utf-8")], cc, bcc, _attachment_parts(attachments), from_header=sender)
     conn = imap_connect(cfg)
     try:
-        return _draft_result(_append_draft(conn, msg), msg)
+        result = _draft_result(_append_draft(conn, msg), msg)
+        if note:
+            result["note"] = note
+        return result
     finally:
         try:
             conn.logout()
@@ -944,7 +1013,7 @@ def imap_create_draft(cfg, to, subject, body, cc, bcc, attachments):
             pass
 
 
-def imap_create_reply_draft(cfg, folder, uid, body, reply_all, attachments):
+def imap_create_reply_draft(cfg, folder, uid, body, reply_all, attachments, from_addr=None):
     uid = _validate_uid(uid)
     att_parts = _attachment_parts(attachments)
     conn = imap_connect(cfg)
@@ -955,16 +1024,19 @@ def imap_create_reply_draft(cfg, folder, uid, body, reply_all, attachments):
         orig, _flags = _fetch_full(conn, uid)
         if orig is None:
             raise RuntimeError(f"message uid {uid} not found in {folder!r}")
+        sender, note = _pick_from(cfg, from_addr, orig)
         r = _reply_fields(cfg, orig, body, reply_all)
         # Bridge drops In-Reply-To/References here: it creates the draft through Proton's API
         # with no ParentID (verified live and in createDraftWithParser), so the draft is not
         # linked to the original conversation. Set anyway — it's what a mail client would send.
         msg = _compose(
             cfg, r["to"], r["subject"], [MIMEText(r["body"], "plain", "utf-8")], r["cc"],
-            attachments=att_parts, extra_headers=r["threading"],
+            attachments=att_parts, extra_headers=r["threading"], from_header=sender,
         )
         result = _draft_result(_append_draft(conn, msg), msg)
         result["in_reply_to"] = r["in_reply_to"]
+        if note:
+            result["note"] = note
         return result
     finally:
         try:
@@ -985,7 +1057,7 @@ def _content_only(part):
     return part
 
 
-def imap_update_draft(cfg, uid, to, subject, body, cc, bcc, attachments, remove_attachments):
+def imap_update_draft(cfg, uid, to, subject, body, cc, bcc, attachments, remove_attachments, from_addr=None):
     # IMAP messages are immutable, so "edit in place" = APPEND the new version, then move
     # the old one to Trash (recoverable, same as delete_draft). APPEND first, so a failure
     # in between leaves two drafts rather than none.
@@ -994,6 +1066,7 @@ def imap_update_draft(cfg, uid, to, subject, body, cc, bcc, attachments, remove_
         _reject_crlf(value, field)
     if isinstance(remove_attachments, str):
         remove_attachments = [remove_attachments]
+    new_from = _pick_from(cfg, from_addr)[0] if from_addr else None
     conn = imap_connect(cfg)
     try:
         status, _ = conn.select(_imap_quote(DRAFTS_FOLDER), readonly=False)
@@ -1036,7 +1109,7 @@ def imap_update_draft(cfg, uid, to, subject, body, cc, bcc, attachments, remove_
             bcc if bcc is not None else _unfold(old.get("Bcc")),
             kept + new_parts,
             extra_headers=(("In-Reply-To", _unfold(old.get("In-Reply-To"))), ("References", _unfold(old.get("References")))),
-            from_header=_unfold(old.get("From")) or None,  # keep the sending address/alias the draft already had
+            from_header=new_from or _unfold(old.get("From")) or None,  # else keep the address/alias the draft already had
         )
         new_uid = _append_draft(conn, msg)
         try:
@@ -1084,6 +1157,14 @@ def imap_delete_draft(cfg, uid):
         except Exception:
             pass
 
+
+FROM_SCHEMA = {
+    "type": "string",
+    "description": (
+        "sending address: the account login or one of its aliases (config `aliases`). Omit it and a "
+        "reply goes out from the address the original was sent to, anything else from the default"
+    ),
+}
 
 ATTACHMENTS_SCHEMA = {
     "type": "array",
@@ -1184,7 +1265,7 @@ TOOLS = [
     },
     {
         "name": "send_email",
-        "description": "Send an email from the personal Proton account.",
+        "description": "Send an email from this account (or one of its aliases, see `from`).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1193,6 +1274,7 @@ TOOLS = [
                 "body": {"type": "string"},
                 "cc": {"type": "string"},
                 "bcc": {"type": "string"},
+                "from": FROM_SCHEMA,
             },
             "required": ["to", "subject", "body"],
         },
@@ -1242,6 +1324,7 @@ TOOLS = [
                 "folder": {"type": "string", "default": "INBOX"},
                 "body": {"type": "string"},
                 "reply_all": {"type": "boolean", "default": False},
+                "from": FROM_SCHEMA,
             },
             "required": ["uid", "body"],
         },
@@ -1259,6 +1342,7 @@ TOOLS = [
                 "cc": {"type": "string"},
                 "bcc": {"type": "string"},
                 "attachments": ATTACHMENTS_SCHEMA,
+                "from": FROM_SCHEMA,
             },
             "required": ["to", "subject", "body"],
         },
@@ -1282,6 +1366,7 @@ TOOLS = [
                 "body": {"type": "string"},
                 "reply_all": {"type": "boolean", "default": False},
                 "attachments": ATTACHMENTS_SCHEMA,
+                "from": FROM_SCHEMA,
             },
             "required": ["uid", "body"],
         },
@@ -1306,6 +1391,7 @@ TOOLS = [
                 "cc": {"type": "string", "description": "replaces the Cc list (empty string clears it)"},
                 "bcc": {"type": "string", "description": "replaces the Bcc list (empty string clears it)"},
                 "subject": {"type": "string"},
+                "from": FROM_SCHEMA,
                 "body": {"type": "string", "description": "replaces the whole body, as plain text"},
                 "attachments": ATTACHMENTS_SCHEMA,
                 "remove_attachments": {
@@ -1401,7 +1487,7 @@ def dispatch_tool(cfg, name, args):
     if name == "download_attachment":
         return imap_download_attachment(cfg, args.get("folder", "INBOX"), args["uid"], args["filename"])
     if name == "send_email":
-        return smtp_send(cfg, args["to"], args["subject"], args["body"], args.get("cc"), args.get("bcc"))
+        return smtp_send(cfg, args["to"], args["subject"], args["body"], args.get("cc"), args.get("bcc"), args.get("from"))
     if name == "get_unread_count":
         return imap_unread_count(cfg, args.get("folder", "INBOX"))
     if name == "mark_read":
@@ -1409,14 +1495,18 @@ def dispatch_tool(cfg, name, args):
     if name == "move_email":
         return imap_move(cfg, args.get("folder", "INBOX"), args["uid"], args["target_folder"])
     if name == "reply_to_email":
-        return imap_reply(cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False))
+        return imap_reply(
+            cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False), args.get("from")
+        )
     if name == "create_draft":
         return imap_create_draft(
-            cfg, args["to"], args["subject"], args["body"], args.get("cc"), args.get("bcc"), args.get("attachments")
+            cfg, args["to"], args["subject"], args["body"], args.get("cc"), args.get("bcc"), args.get("attachments"),
+            args.get("from"),
         )
     if name == "create_reply_draft":
         return imap_create_reply_draft(
-            cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False), args.get("attachments")
+            cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False), args.get("attachments"),
+            args.get("from"),
         )
     if name == "update_draft":
         return imap_update_draft(
@@ -1429,6 +1519,7 @@ def dispatch_tool(cfg, name, args):
             args.get("bcc"),
             args.get("attachments"),
             args.get("remove_attachments"),
+            args.get("from"),
         )
     if name == "delete_draft":
         return imap_delete_draft(cfg, args["uid"])
