@@ -67,12 +67,13 @@ Each account gets its own config file (so its own file permissions and blast rad
 | `get_unread_count` | yes | |
 | `mark_read` | no | toggles `\Seen`, reversible |
 | `move_email` | no | to an existing folder/label |
-| `reply_to_email` | no | threads via In-Reply-To/References, quotes the original |
+| `reply_to_email` | no | threads via In-Reply-To/References, quotes the original; optional local attachments |
 | `create_draft` | no | saves without sending (to/cc/bcc, optional local attachments), returns the new draft's UID |
 | `create_reply_draft` | no | like `reply_to_email` but saved to Drafts instead of sent — see [Drafts](#drafts) for the threading caveat |
 | `update_draft` | no | edits a draft: only the fields passed change, the rest (incl. HTML body and attachments) is carried over; returns the draft's **new** UID |
+| `send_draft` | no | sends a saved draft exactly as reviewed (recipients, From, body, attachments, reply threading all from the draft); Drafts folder only, refuses anything not flagged `\Draft`; afterwards moves the draft to Trash unless `keep_draft` |
 | `delete_draft` | no | Drafts folder only, refuses anything not flagged `\Draft`; moves to Trash (recoverable) instead of expunging, since Bridge turns an expunge from Drafts into a permanent delete |
-| `send_email` | no | |
+| `send_email` | no | optional local attachments (same path rules and 25 MB total as drafts); Bcc goes only in the envelope |
 
 Every non-read-only tool is annotated as such (`readOnlyHint: false`), so MCP clients will ask for confirmation before running it.
 

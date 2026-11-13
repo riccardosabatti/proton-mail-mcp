@@ -37,7 +37,7 @@ from email import encoders, message_from_bytes
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formataddr, parseaddr, getaddresses, parsedate_to_datetime
+from email.utils import formataddr, parseaddr, getaddresses, parsedate_to_datetime, formatdate, make_msgid
 
 CONFIG_PATH = os.path.expanduser(
     sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PROTON_MCP_CONFIG", "~/.config/proton-mcp/config.json")
@@ -902,19 +902,18 @@ def _smtp_deliver(cfg, msg, all_recipients):
         server.sendmail(cfg["email"], all_recipients, msg.as_string())
 
 
-def smtp_send(cfg, to, subject, body, cc, bcc, from_addr=None):
+def smtp_send(cfg, to, subject, body, cc, bcc, from_addr=None, attachments=None):
     for field, value in (("to", to), ("subject", subject), ("cc", cc), ("bcc", bcc)):
         _reject_crlf(value, field)
     sender, note = _pick_from(cfg, from_addr)
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = to
-    if cc:
-        msg["Cc"] = cc
+    files = _attachment_parts(attachments)  # validated before anything goes out
+    # Bcc stays out of the headers: the recipients get it only through the envelope.
+    msg = _compose(cfg, to, subject, [MIMEText(body, "plain", "utf-8")], cc, None, files, from_header=sender)
     all_recipients = [addr for _, addr in _addr_list(to, cc, bcc) if addr]
     _smtp_deliver(cfg, msg, all_recipients)
     result = {"from": sender, "sent_to": all_recipients, "subject": subject}
+    if files:
+        result["attachments"] = _attachment_list(msg)
     if note:
         result["note"] = note
     return result
@@ -958,8 +957,9 @@ def _reply_fields(cfg, orig, body, reply_all):
     }
 
 
-def imap_reply(cfg, folder, uid, body, reply_all, from_addr=None):
+def imap_reply(cfg, folder, uid, body, reply_all, from_addr=None, attachments=None):
     uid = _validate_uid(uid)
+    files = _attachment_parts(attachments)  # validated before anything goes out
     conn = imap_connect(cfg)
     try:
         status, _ = conn.select(_imap_quote(folder), readonly=False)
@@ -973,7 +973,7 @@ def imap_reply(cfg, folder, uid, body, reply_all, from_addr=None):
         r = _reply_fields(cfg, orig, body, reply_all)
         msg = _compose(
             cfg, r["to"], r["subject"], [MIMEText(r["body"], "plain", "utf-8")], r["cc"],
-            extra_headers=r["threading"], from_header=sender,
+            attachments=files, extra_headers=r["threading"], from_header=sender,
         )
 
         all_recipients = [addr for _, addr in _addr_list(r["to"], r["cc"]) if addr]
@@ -985,6 +985,8 @@ def imap_reply(cfg, folder, uid, body, reply_all, from_addr=None):
             pass  # best-effort — the reply already went out, don't fail the tool over a flag
 
         result = {"from": sender, "sent_to": all_recipients, "subject": r["subject"], "in_reply_to": r["in_reply_to"]}
+        if files:
+            result["attachments"] = _attachment_list(msg)
         if note:
             result["note"] = note
         return result
@@ -1122,6 +1124,80 @@ def imap_update_draft(cfg, uid, to, subject, body, cc, bcc, attachments, remove_
         result = _draft_result(new_uid, msg)
         result["previous_uid"] = uid
         result["previous_moved_to"] = TRASH_FOLDER
+        return result
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def _mark_answered(conn, msgid):
+    """Best effort: flag the message a sent draft replied to as \\Answered, wherever INBOX has it."""
+    if not msgid:
+        return
+    try:
+        conn.select(_imap_quote("INBOX"), readonly=False)
+        uids = _uid_search_literal(conn, "HEADER Message-ID", msgid)
+        for u in sorted(uids)[:5]:
+            conn.uid("STORE", u, "+FLAGS", "(\\Answered)")
+    except Exception:
+        pass
+
+
+def imap_send_draft(cfg, uid, keep_draft=False):
+    """Send a saved draft exactly as it is: recipients, subject, body, attachments, From and
+    the reply threading (In-Reply-To/References) all come from the draft itself, so what was
+    reviewed is what goes out. Like Send in a mail client, the draft then leaves Drafts (moved
+    to Trash, recoverable) unless keep_draft; the provider files the sent copy in Sent."""
+    uid = _validate_uid(uid)
+    conn = imap_connect(cfg)
+    try:
+        status, _ = conn.select(_imap_quote(DRAFTS_FOLDER), readonly=False)
+        if status != "OK":
+            raise RuntimeError(f"cannot open folder {DRAFTS_FOLDER!r}")
+        msg = _fetch_draft(conn, uid, "BODY.PEEK[]")
+
+        to, cc, bcc = (_unfold(msg.get(h)) for h in ("To", "Cc", "Bcc"))
+        for field, value in (("to", to), ("cc", cc), ("bcc", bcc)):
+            _reject_crlf(value, field)
+        recipients = [a for _, a in _addr_list(to, cc, bcc) if a]
+        if not recipients:
+            raise RuntimeError(f"draft uid {uid} has no recipients (To/Cc/Bcc) — set them with update_draft first")
+        # The draft's From must still be an address this account may send as (same rule as
+        # send_email's `from`); none = the account's default.
+        draft_from = parseaddr(_unfold(msg.get("From")) or "")[1]
+        sender, note = _pick_from(cfg, draft_from or None)
+
+        out = copy.deepcopy(msg)
+        for h in ("Bcc", "From", "Date", "Message-ID"):
+            del out[h]
+        out["From"] = sender
+        out["Date"] = formatdate(localtime=True)
+        out["Message-ID"] = make_msgid(domain=sender.rsplit("@", 1)[-1])
+        _smtp_deliver(cfg, out, recipients)
+
+        result = {
+            "sent": True,
+            "from": sender,
+            "sent_to": recipients,
+            "subject": _decode_header_value(out.get("Subject")),
+            "attachments": _attachment_list(out),
+            "message_id": out["Message-ID"],
+        }
+        if _unfold(out.get("In-Reply-To")):
+            result["in_reply_to"] = _unfold(out.get("In-Reply-To"))
+        if note:
+            result["note"] = note
+        if keep_draft:
+            result["draft_kept"] = uid
+        else:
+            try:
+                _uid_move(conn, uid, TRASH_FOLDER)
+                result["draft_moved_to"] = TRASH_FOLDER
+            except Exception as e:  # it went out already: report, don't fail
+                result["warning"] = f"sent, but the draft (uid {uid}) could not be moved to {TRASH_FOLDER}: {e} — delete it so it is not sent twice"
+        _mark_answered(conn, _unfold(out.get("In-Reply-To")))
         return result
     finally:
         try:
@@ -1275,6 +1351,7 @@ TOOLS = [
                 "cc": {"type": "string"},
                 "bcc": {"type": "string"},
                 "from": FROM_SCHEMA,
+                "attachments": ATTACHMENTS_SCHEMA,
             },
             "required": ["to", "subject", "body"],
         },
@@ -1325,6 +1402,7 @@ TOOLS = [
                 "body": {"type": "string"},
                 "reply_all": {"type": "boolean", "default": False},
                 "from": FROM_SCHEMA,
+                "attachments": ATTACHMENTS_SCHEMA,
             },
             "required": ["uid", "body"],
         },
@@ -1403,6 +1481,26 @@ TOOLS = [
             "required": ["uid"],
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True},
+    },
+    {
+        "name": "send_draft",
+        "description": (
+            "Send a saved draft as it is (uid from create_draft/create_reply_draft/update_draft, or "
+            "search_emails with folder='Drafts'): its recipients, subject, body, attachments, From and reply "
+            "threading all come from the draft, so what was reviewed is what goes out. Only acts on the Drafts "
+            "folder and refuses anything not flagged as a draft. Afterwards the draft is moved to Trash "
+            "(recoverable) unless keep_draft; the sent copy lands in Sent. Sending cannot be undone: only send "
+            "a draft the user has approved."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uid": {"type": "string", "description": "UID within the Drafts folder"},
+                "keep_draft": {"type": "boolean", "default": False, "description": "leave the draft in Drafts after sending"},
+            },
+            "required": ["uid"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
     },
     {
         "name": "delete_draft",
@@ -1487,7 +1585,10 @@ def dispatch_tool(cfg, name, args):
     if name == "download_attachment":
         return imap_download_attachment(cfg, args.get("folder", "INBOX"), args["uid"], args["filename"])
     if name == "send_email":
-        return smtp_send(cfg, args["to"], args["subject"], args["body"], args.get("cc"), args.get("bcc"), args.get("from"))
+        return smtp_send(
+            cfg, args["to"], args["subject"], args["body"], args.get("cc"), args.get("bcc"), args.get("from"),
+            args.get("attachments"),
+        )
     if name == "get_unread_count":
         return imap_unread_count(cfg, args.get("folder", "INBOX"))
     if name == "mark_read":
@@ -1496,7 +1597,8 @@ def dispatch_tool(cfg, name, args):
         return imap_move(cfg, args.get("folder", "INBOX"), args["uid"], args["target_folder"])
     if name == "reply_to_email":
         return imap_reply(
-            cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False), args.get("from")
+            cfg, args.get("folder", "INBOX"), args["uid"], args["body"], args.get("reply_all", False), args.get("from"),
+            args.get("attachments"),
         )
     if name == "create_draft":
         return imap_create_draft(
@@ -1521,6 +1623,8 @@ def dispatch_tool(cfg, name, args):
             args.get("remove_attachments"),
             args.get("from"),
         )
+    if name == "send_draft":
+        return imap_send_draft(cfg, args["uid"], args.get("keep_draft", False))
     if name == "delete_draft":
         return imap_delete_draft(cfg, args["uid"])
     raise RuntimeError(f"unknown tool {name!r}")
